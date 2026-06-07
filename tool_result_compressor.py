@@ -8,7 +8,7 @@ drastically reducing token count.
 Pipeline::
 
     ContentRouter.identify(content) → content type
-        ├─ "json"      → SmartCrusher.compress(content)
+        ├─ "json_array" / "json_object" → SmartCrusher.compress(content)
         ├─ "search"    → SearchCompressor.compress(content)
         ├─ "log"       → LogCompressor.compress(content)
         ├─ "diff"      → DiffCompressor.compress(content)
@@ -22,8 +22,8 @@ import hashlib
 import json
 import logging
 import re
-from enum import Enum, auto
-from typing import Any, Optional
+from enum import Enum
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -70,8 +70,8 @@ def estimate_tokens(text: str) -> int:
 class ContentType(Enum):
     """Content types recognised by the detector.  Mirrors Headroom's enum."""
 
-    JSON_ARRAY = "json"
-    JSON_OBJECT = "json"
+    JSON_ARRAY = "json_array"
+    JSON_OBJECT = "json_object"
     SOURCE_CODE = "code"
     SEARCH_RESULTS = "search"
     BUILD_OUTPUT = "log"
@@ -80,9 +80,17 @@ class ContentType(Enum):
     PROSE = "prose"
 
 
+# ── Utility ────────────────────────────────────────────────────────────
+
+
+def _hash_prefix(s: str, length: int = 16) -> str:
+    """Stable hex hash prefix."""
+    return hashlib.sha256(s.encode("utf-8", errors="replace")).hexdigest()[:length]
+
+
 # ── Precompiled regex patterns (compiled once, shared) ───────────────────
 
-_SEARCH_RESULT_RE = re.compile(r"^[^\s:]+:\d+:", re.MULTILINE)
+_SEARCH_RESULT_RE = re.compile(r"^[^\s:]+\.[a-z]{1,8}:\d+:", re.MULTILINE)
 
 _DIFF_HEADER_RE = re.compile(
     r"^(diff --git|diff --combined |diff --cc |--- a/|@@\s+-\d+(?:,\d+)?\s+\+\d+(?:,\d+)?\s+@@|@@@+)",
@@ -115,11 +123,6 @@ _MAKE_MARKERS = [
 _HTML_DOCTYPE_RE = re.compile(r"(?i)<!DOCTYPE\s+html")
 _HTML_TAG_RE = re.compile(r"(?i)</?html\b")
 _HTML_STRUCTURAL = re.compile(r"(?i)</?(head|body|div|span|p|table|a|img|script)\b")
-
-# Common source-code extension signals
-_CODE_EXTENSIONS = {".py", ".js", ".ts", ".go", ".rs", ".java",
-                    ".cpp", ".c", ".h", ".rb", ".php", ".swift",
-                    ".kt", ".scala", ".cs", ".sh", ".bash", ".zsh"}
 
 # Patterns that strongly indicate source code (not prose)
 _CODE_SIGNALS = re.compile(
@@ -161,10 +164,9 @@ def _content_type_diff(content: str) -> tuple[ContentType, float, dict[str, Any]
 
 def _content_type_html(content: str) -> tuple[ContentType, float, dict[str, Any]]:
     """HTML detection via doctype, tags, and structural elements."""
-    lower = content.lower()
-    has_doctype = bool(_HTML_DOCTYPE_RE.search(lower))
-    has_html_tag = bool(_HTML_TAG_RE.search(lower))
-    structural = len(_HTML_STRUCTURAL.findall(lower))
+    has_doctype = bool(_HTML_DOCTYPE_RE.search(content))
+    has_html_tag = bool(_HTML_TAG_RE.search(content))
+    structural = len(_HTML_STRUCTURAL.findall(content))
     confidence = 0.0
     if has_doctype:
         confidence += 0.5
@@ -254,11 +256,22 @@ class ContentRouter:
 
     @staticmethod
     def identify(content: str) -> tuple[ContentType, float, dict[str, Any]]:
-        """Return ``(content_type, confidence, metadata)``."""
+        """Return ``(content_type, confidence, metadata)``.
+
+        JSON check runs first and short-circuits: if the content parses
+        as valid JSON with confidence ≥ 0.8, it wins immediately.  JSON
+        parsing is the most precise test and must not be overruled by
+        weaker regex-based detectors.
+        """
         if not content or not content.strip():
             return ContentType.PROSE, 1.0, {}
+        # JSON first — if it parses, it IS JSON (modulo edge cases like
+        # single strings/numbers, which get low confidence)
+        ct, conf, meta = _content_type_json(content)
+        if ct != ContentType.PROSE and conf >= 0.8:
+            return ct, conf, meta
         best_type, best_conf, best_meta = ContentType.PROSE, 0.0, {}
-        for checker in ContentRouter.CHECKERS:
+        for checker in ContentRouter.CHECKERS[1:]:  # skip JSON (already checked)
             ct, conf, meta = checker(content)
             if ct != ContentType.PROSE and conf > best_conf:
                 best_type, best_conf, best_meta = ct, conf, meta
@@ -335,16 +348,19 @@ class SmartCrusher:
         mid_count = self.max_items - keep_first - keep_last
         if mid_count <= 0:
             mid_count = max(1, self.max_items - keep_first)
-        middle = arr[keep_first:-keep_last]
-        if len(middle) > mid_count:
-            step = max(1, len(middle) // mid_count)
-            middle = middle[::step][:mid_count]
+        original_mid = arr[keep_first:-keep_last]
+        if len(original_mid) > mid_count:
+            step = max(1, len(original_mid) // mid_count)
+            sampled_mid = original_mid[::step][:mid_count]
+        else:
+            sampled_mid = original_mid
+        omitted = len(original_mid) - len(sampled_mid)
         result: list[Any] = []
         result.extend(self._compress_value(v, 0) for v in arr[:keep_first])
-        if len(middle) > 0:
-            result.append(f"[... {len(arr) - keep_first - keep_last - len(middle)} items omitted ...]")
-        result.extend(self._compress_value(v, 0) for v in middle)
+        result.extend(self._compress_value(v, 0) for v in sampled_mid)
         result.extend(self._compress_value(v, 0) for v in arr[-keep_last:])
+        if omitted > 0:
+            result.append(f"[... {omitted} items omitted ...]")
         return result
 
     # ── Object compression ─────────────────────────────────────────────
@@ -397,11 +413,8 @@ class SmartCrusher:
         # Detect base64 blobs (check against full string before truncation)
         if self._is_base64_blob(s):
             return f"[base64 blob: {len(s)} chars, hash={_hash_prefix(s)}]"
-        # Detect HTML
-        if s.count("<") >= 3 and any(
-            s[i:i+2] in ("</", "<!", "<a", "<d", "<s", "<p", "<t")
-            for i in range(min(len(s) - 1, 2000))
-        ):
+        # Detect HTML (fast regex scan over prefix, avoids O(n) char loop)
+        if s.count("<") >= 3 and re.search(r"<[a-zA-Z/!]", s[:2000]):
             return f"[HTML: {len(s)} chars]"
         # Keep prefix + suffix for long text
         half = limit // 2
@@ -439,6 +452,8 @@ class SearchCompressor:
     lines (``file-line-content``).  Compression: keep most relevant
     matches, deduplicate, summarise.
     """
+
+    _HEADER_MARGIN: int = 5  # slack for summary banners above main output
 
     def __init__(
         self,
@@ -504,7 +519,8 @@ class SearchCompressor:
         if dropped > 0:
             output.insert(0, f"[{dropped} files with fewer matches omitted]")
 
-        return "\n".join(output[:self.max_matches + 5])
+        # _HEADER_MARGIN accounts for summary banners inserted above main output
+        return "\n".join(output[:self.max_matches + self._HEADER_MARGIN])
 
     def _fallback_compress(self, lines: list[str]) -> str:
         """Simple truncation for unrecognised search format."""
@@ -578,15 +594,24 @@ class LogCompressor:
         # Score every line
         scored: list[tuple[int, int, str]] = []  # (index, score, line)
         in_stacktrace = False
+        blank_in_trace = 0  # tolerate up to 1 blank line within stack traces
         for i, line in enumerate(lines):
             score = 0
 
             # Check if entering/continuing stack trace
             if _STACKTRACE_START_RE.match(line):
                 in_stacktrace = True
+                blank_in_trace = 0
                 score = 8
             elif in_stacktrace:
-                if line and line.strip() and (line[0] == " " or line[0] == "\t"):
+                if not line.strip():
+                    blank_in_trace += 1
+                    if blank_in_trace <= 1:
+                        score = 5  # keep blank line, may be intra-trace separator
+                    else:
+                        in_stacktrace = False
+                elif line and line[0] in (" ", "\t"):
+                    blank_in_trace = 0
                     score = 6
                 else:
                     in_stacktrace = False
@@ -728,11 +753,13 @@ class DiffCompressor:
         if current_hunk:
             hunks.append(current_hunk)
 
-        # Cap hunks
+        # Cap hunks — use config, not hardcoded slice
         if len(hunks) > self.max_hunks_per_file:
-            kept = hunks[:3] + hunks[-3:]
+            half = self.max_hunks_per_file // 2
+            tail_half = self.max_hunks_per_file - half  # odd values → tail gets the extra
+            kept = hunks[:half] + hunks[-tail_half:]
             result = list(header_lines)
-            result.append(f"[... {len(hunks) - 6} hunks omitted ...]")
+            result.append(f"[... {len(hunks) - len(kept)} hunks omitted ...]")
             for hunk in kept:
                 result.extend(self._trim_context(hunk))
             return result
@@ -855,11 +882,16 @@ class CacheAligner:
 
     @staticmethod
     def align(compressed: str, tool_name: str = "") -> str:
-        """Return aligned output with a stable prefix."""
-        # Hash the compressed content for a cache-aware fingerprint
-        fp = _hash_prefix(compressed)
-        header = f"[compressed {tool_name} | sha:{fp}]\n" if tool_name else f"[compressed | sha:{fp}]\n"
-        return header + compressed
+        """Return aligned output with a prefix-stable header.
+
+        The header itself is the KV-cache-friendly prefix — only the tool
+        name, no content-dependent data. The hash appears inline but AFTER
+        the stable header bytes, so provider caches hit on shared prefix.
+        """
+        fp = CacheAligner.compute_stable_hash(compressed)
+        # Tool name goes first (cache-friendly prefix), hash follows
+        prefix = f"[compressed {tool_name}]" if tool_name else "[compressed]"
+        return f"{prefix} | sha:{fp}\n{compressed}"
 
     @staticmethod
     def compute_stable_hash(content: str, chunk_size: int = 4096) -> str:
@@ -919,13 +951,19 @@ class CompressionPipeline:
                 compressed = self.log_compressor.compress(content)
             elif ct == ContentType.GIT_DIFF:
                 compressed = self.diff_compressor.compress(content)
+            elif ct == ContentType.SOURCE_CODE:
+                # Code detected but no dedicated compressor yet — treat as prose
+                compressed = self.prose_compressor.compress(content)
             elif ct == ContentType.HTML:
                 # HTML: strip tags attempt, then compress as prose
                 stripped = re.sub(r"<[^>]+>", " ", content)
                 stripped = re.sub(r"\s+", " ", stripped).strip()
                 compressed = self.prose_compressor.compress(stripped)
-            else:
+            elif ct == ContentType.PROSE:
                 compressed = self.prose_compressor.compress(content)
+            else:
+                logger.warning("Unhandled content type %s; returning original", ct.value)
+                compressed = content
         except Exception:
             logger.debug("Compression failed; returning original", exc_info=True)
             return content
@@ -944,11 +982,6 @@ class CompressionPipeline:
 
 # Module-level singleton for the compression pipeline
 _PIPELINE = CompressionPipeline()
-
-
-def _hash_prefix(s: str, length: int = 16) -> str:
-    """Stable hex hash prefix."""
-    return hashlib.sha256(s.encode("utf-8", errors="replace")).hexdigest()[:length]
 
 
 def maybe_compress_tool_result(

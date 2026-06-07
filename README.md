@@ -19,9 +19,9 @@ Replaces LLM-based summarization with a **predictable, testable, sub-millisecond
 cp tool_result_compressor.py /path/to/hermes-agent/agent/
 ```
 
-That's it. Hermes's existing `tool_executor.py` calls `maybe_compress_tool_result()` — the new implementation automatically takes over.
+Restart Hermes. That's it — `tool_executor.py` calls `maybe_compress_tool_result()` automatically. No import changes, no config changes.
 
-## Architecture
+## How It Works
 
 ```
                    ┌──────────────────────────────┐
@@ -58,33 +58,29 @@ That's it. Hermes's existing `tool_executor.py` calls `maybe_compress_tool_resul
 
 | Content Type | Detected By | Compressor | Typical Reduction |
 |---|---|---|---|
-| `json_array` / `json_object` | `json.loads()` parse test | SmartCrusher: preserve fields + high-value keys, truncate blobs, cap array length | 40-98% |
-| `search` | `file:line:content` regex | SearchCompressor: group by file, keep top N, uniform middle sampling | 90-95% |
-| `log` | log-level keywords + format markers | LogCompressor: severity scoring, keep errors/fails, deduplicate warnings, context window | 80-95% |
-| `diff` | `diff --git` / `@@` headers | DiffCompressor: cap files + hunks, trim context around changes | 50-80% |
-| `html` | doctype / structural tags | Strip tags to ProseCompressor | 60-90% |
-| `prose` | fallback | ProseCompressor: head + key sentences + tail | 50-85% |
+| `json_array` / `json_object` | `json.loads()` parse test | SmartCrusher: preserve fields + high-value keys, truncate blobs, cap array length | 40–98% |
+| `search` | `file:line:content` regex | SearchCompressor: group by file, keep top N, uniform middle sampling | 90–95% |
+| `log` | log-level keywords + format markers | LogCompressor: severity scoring, keep errors/fails, deduplicate warnings, context window | 80–95% |
+| `diff` | `diff --git` / `@@` headers | DiffCompressor: cap files + hunks, trim context around changes | 50–80% |
+| `html` | doctype / structural tags | Strip tags → ProseCompressor | 60–90% |
+| `prose` | fallback | ProseCompressor: head + key sentences + tail | 50–85% |
 
-## API
+## Integration
 
-```python
-from agent.tool_result_compressor import maybe_compress_tool_result
+This is a **drop-in patch** for Hermes Agent. Replace `agent/tool_result_compressor.py` and restart:
 
-# Hermes's existing hook - same signature
-compressed = maybe_compress_tool_result(
-    tool_name="search_files",
-    result_content=huge_grep_output,
-    agent=agent_instance,
-    max_tokens=3000,      # compress only if over threshold
-)
+```bash
+cp tool_result_compressor.py <hermes-home>/hermes-agent/agent/tool_result_compressor.py
 ```
+
+Hermes's `tool_executor.py` calls `maybe_compress_tool_result()` on every tool result that exceeds the token threshold — the new compressor takes over transparently. No code changes needed elsewhere.
 
 ## Changelog
 
-### 2026-06-07 - Audit fix round 1
+### 2026-06-07 — Audit fix round 1
 
-- **ContentType enum collision**: `JSON_ARRAY == JSON_OBJECT` -> distinct values `"json_array"` / `"json_object"`
-- **CacheAligner prefix**: SHA hash no longer embedded in prefix (self-defeating for KV cache); now uses stable tool-name-only prefix
+- **ContentType enum collision**: `JSON_ARRAY == JSON_OBJECT` → distinct values `"json_array"` / `"json_object"`
+- **CacheAligner prefix**: SHA hash no longer embedded in prefix (was self-defeating for KV cache); now uses stable tool-name-only prefix
 - **ContentRouter priority**: JSON detection short-circuits to prevent keyword-rich fields from being misclassified as log
 - **DiffCompressor hunk cap**: odd `max_hunks_per_file` values now handled correctly (no silent hunk loss)
 - **LogCompressor trace blanks**: stack traces with blank lines between chained exceptions no longer terminate early
@@ -92,7 +88,7 @@ compressed = maybe_compress_tool_result(
 - **SearchCompressor NameError**: `_HEADER_MARGIN` accessed as class attribute via `self.`
 - 7 minor cleanups (dead code, redundant `.lower()`, magic numbers, regex optimization, docstring sync)
 
-### 2026-06-07 - Initial release
+### 2026-06-07 — Initial release
 
 Port of Headroom's Rust pipeline to Python. Replaces LLM-based `_summarize_with_llm()` with deterministic multi-strategy compression.
 
